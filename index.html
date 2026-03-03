@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Golf Range Helper (Boston &amp; Peterborough)</title>
+
+  <!-- Leaflet CSS -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+    crossorigin=""
+  />
+
+  <style>
+    html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    #app { display: grid; grid-template-rows: auto 1fr; height: 100%; }
+    #topbar { padding: 10px; border-bottom: 1px solid #ddd; background: #fff; }
+    #map { height: 100%; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    button { padding: 10px 12px; border: 1px solid #ccc; border-radius: 10px; background: #f7f7f7; cursor: pointer; }
+    button:active { transform: translateY(1px); }
+    .pill { padding: 6px 10px; border: 1px solid #ddd; border-radius: 999px; background: #fafafa; }
+    .panel { margin-top: 10px; display: grid; gap: 8px; }
+    input, select { padding: 8px; border: 1px solid #ccc; border-radius: 10px; }
+    input { width: 110px; }
+    select { min-width: 260px; max-width: 100%; }
+    .small { font-size: 13px; color: #555; }
+    .warn { color: #8a5b00; }
+  </style>
+</head>
+
+<body>
+  <div id="app">
+    <div id="topbar">
+      <!-- Row for GPS and course selection -->
+      <div class="row">
+        <button id="btnLocate">Use my GPS</button>
+        <button id="btnFindCourses">Find nearby courses</button>
+        <select id="courseSelect" title="Choose a course">
+          <!-- Options will be populated by JS -->
+        </select>
+        <button id="btnGoCourse">Go</button>
+      </div>
+
+      <!-- Row for marking ball and target -->
+      <div class="row" style="margin-top:8px;">
+        <button id="btnSetBall">Tap to set BALL</button>
+        <button id="btnSetTarget">Tap to set TARGET</button>
+        <button id="btnClear">Clear marks</button>
+      </div>
+
+      <div class="panel">
+        <div class="row">
+          <span class="pill" id="modePill">Mode: none</span>
+          <span class="pill" id="ballPill">Ball: not set</span>
+          <span class="pill" id="targetPill">Target: not set</span>
+        </div>
+
+        <div class="row">
+          <span class="pill" id="distPill">Ball → Target: —</span>
+          <span class="pill" id="shotPill">Last shot: —</span>
+          <span class="pill" id="clubPill">Suggestion: —</span>
+        </div>
+
+        <!-- Clubs collapsible section -->
+        <details>
+          <summary><strong>Club distances</strong> (tap to open)</summary>
+          <div class="small">Enter your typical total distance for each club (yards). Saved on your phone.</div>
+          <div class="row" id="clubInputs"></div>
+          <div class="row">
+            <button id="btnSaveClubs">Save clubs</button>
+            <span class="small warn">Tip: GPS needs HTTPS and permission.</span>
+          </div>
+        </details>
+
+        <div class="small" id="statusText">
+          How to use: select a course, press “Tap to set BALL”, tap the map where your ball is. Then “Tap to set TARGET”, tap the green/flag area.
+        </div>
+      </div>
+    </div>
+
+    <div id="map"></div>
+  </div>
+
+  <!-- Leaflet JS -->
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+    crossorigin=""
+  ></script>
+
+  <script>
+    // ---------- Utilities ----------
+    function haversineMeters(lat1, lon1, lat2, lon2) {
+      const R = 6371000;
+      const toRad = d => d * Math.PI / 180;
+      const dLat = toRad(lat2 - lat1);
+      const dLon = toRad(lon2 - lon1);
+      const a =
+        Math.sin(dLat/2) * Math.sin(dLat/2) +
+        Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+        Math.sin(dLon/2) * Math.sin(dLon/2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      return R * c;
+    }
+    function metersToYards(m) { return m * 1.0936133; }
+    function fmtYards(y) { return isFinite(y) ? (Math.round(y) + " yd") : "—"; }
+
+    // ---------- Favourite courses ----------
+    // Predefined courses for convenience. Lat/lon values were looked up via OpenStreetMap Nominatim.
+    const FAVORITE_COURSES = [
+      {
+        id: 'fav_boston_west',
+        name: 'Boston West Golf Club',
+        lat: 52.9796029,
+        lon: -0.1177897
+      },
+      {
+        id: 'fav_boston_golf',
+        name: 'Boston Golf Club',
+        lat: 53.0073511,
+        lon: -0.0139500
+      },
+      {
+        id: 'fav_peterborough_milton',
+        name: 'Peterborough Milton Golf Club',
+        lat: 52.5727174,
+        lon: -0.3197177
+      }
+    ];
+
+    // ---------- Clubs ----------
+    const CLUB_KEYS = ["Driver","3W","5W","4i","5i","6i","7i","8i","9i","PW","GW","SW","LW"];
+    const CLUB_STORAGE_KEY = "golf_app_clubs_v1";
+    function loadClubs() {
+      try {
+        const raw = localStorage.getItem(CLUB_STORAGE_KEY);
+        if (!raw) return defaultClubs();
+        const parsed = JSON.parse(raw);
+        const out = {};
+        for (const k of CLUB_KEYS) out[k] = Number(parsed[k] ?? "");
+        return out;
+      } catch { return defaultClubs(); }
+    }
+    function defaultClubs() {
+      const obj = {}; for (const k of CLUB_KEYS) obj[k] = "";
+      return obj;
+    }
+    function suggestClub(distanceYards, clubs) {
+      const entries = Object.entries(clubs)
+        .map(([k,v]) => [k, Number(v)])
+        .filter(([,v]) => Number.isFinite(v) && v > 0)
+        .sort((a,b) => a[1]-b[1]);
+      if (entries.length === 0) return "Set your clubs first";
+      const target = distanceYards;
+      let choice = entries.find(([,v]) => v >= (target - 5));
+      if (!choice) choice = entries[entries.length - 1];
+      return `${choice[0]} (about ${Math.round(choice[1])} yd)`;
+    }
+
+    // ---------- UI state ----------
+    let mode = "none";
+    let ball = null;
+    let target = null;
+    let prevBall = null;
+    let lastFoundCourses = [];
+
+    const modePill = document.getElementById("modePill");
+    const ballPill = document.getElementById("ballPill");
+    const targetPill = document.getElementById("targetPill");
+    const distPill = document.getElementById("distPill");
+    const shotPill = document.getElementById("shotPill");
+    const clubPill = document.getElementById("clubPill");
+    const statusText = document.getElementById("statusText");
+
+    function setMode(m) {
+      mode = m;
+      modePill.textContent = `Mode: ${m === "none" ? "none" : "tap to set " + m.toUpperCase()}`;
+    }
+
+    function updateReadouts() {
+      ballPill.textContent = ball ? `Ball: ${ball.lat.toFixed(5)}, ${ball.lng.toFixed(5)}` : "Ball: not set";
+      targetPill.textContent = target ? `Target: ${target.lat.toFixed(5)}, ${target.lng.toFixed(5)}` : "Target: not set";
+      let distY = NaN;
+      if (ball && target) distY = metersToYards(haversineMeters(ball.lat, ball.lng, target.lat, target.lng));
+      distPill.textContent = `Ball → Target: ${fmtYards(distY)}`;
+      let shotY = NaN;
+      if (prevBall && ball) shotY = metersToYards(haversineMeters(prevBall.lat, prevBall.lng, ball.lat, ball.lng));
+      shotPill.textContent = `Last shot: ${fmtYards(shotY)}`;
+      const clubs = loadClubs();
+      clubPill.textContent = isFinite(distY) ? `Suggestion: ${suggestClub(distY, clubs)}` : "Suggestion: —";
+    }
+
+    // ---------- Map ----------
+    // Default centre: Boston, UK (approx) for initial view
+    const map = L.map("map", { zoomControl: true }).setView([52.976, -0.026], 13);
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+    let ballMarker = null;
+    let targetMarker = null;
+    let line = null;
+    let courseLayer = null;
+    let gpsCircle = null;
+    function redrawMarkers() {
+      if (ballMarker) { map.removeLayer(ballMarker); ballMarker = null; }
+      if (targetMarker) { map.removeLayer(targetMarker); targetMarker = null; }
+      if (line) { map.removeLayer(line); line = null; }
+      if (ball) ballMarker = L.marker([ball.lat, ball.lng]).addTo(map).bindPopup("Ball");
+      if (target) targetMarker = L.marker([target.lat, target.lng]).addTo(map).bindPopup("Target");
+      if (ball && target) line = L.polyline([[ball.lat, ball.lng],[target.lat, target.lng]]).addTo(map);
+      updateReadouts();
+    }
+    map.on("click", (e) => {
+      if (mode === "ball") {
+        prevBall = ball ? {...ball} : prevBall;
+        ball = { lat: e.latlng.lat, lng: e.latlng.lng };
+        redrawMarkers();
+      } else if (mode === "target") {
+        target = { lat: e.latlng.lat, lng: e.latlng.lng };
+        redrawMarkers();
+      }
+    });
+
+    // ---------- GPS ----------
+    async function getGPS() {
+      return new Promise((resolve, reject) => {
+        if (!navigator.geolocation) return reject(new Error("Geolocation not supported."));
+        navigator.geolocation.getCurrentPosition(
+          (pos) => resolve(pos),
+          (err) => reject(err),
+          { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 }
+        );
+      });
+    }
+    document.getElementById("btnLocate").addEventListener("click", async () => {
+      try {
+        statusText.textContent = "Getting your GPS location…";
+        const pos = await getGPS();
+        const { latitude, longitude, accuracy } = pos.coords;
+        map.setView([latitude, longitude], 16);
+        if (gpsCircle) map.removeLayer(gpsCircle);
+        gpsCircle = L.circle([latitude, longitude], { radius: Math.max(accuracy, 10) }).addTo(map);
+        statusText.textContent = `GPS locked (accuracy ~ ${Math.round(accuracy)} m).`;
+      } catch (e) {
+        statusText.textContent = "Could not get GPS location. Make sure location permission is allowed, and the site is HTTPS.";
+        alert("Could not get location: " + (e.message || e));
+      }
+    });
+
+    // ---------- Overpass: find nearby golf courses ----------
+    async function overpassQuery(query) {
+      const url = "https://overpass-api.de/api/interpreter";
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+          body: "data=" + encodeURIComponent(query)
+        });
+        if (!res.ok) throw new Error("Overpass error: " + res.status);
+        return await res.json();
+      } catch (e) {
+        throw e;
+      }
+    }
+    function elementsToCourses(osm) {
+      const courses = [];
+      for (const el of osm.elements || []) {
+        const tags = el.tags || {};
+        const name = tags.name;
+        if (!name) continue;
+        let lat = null, lon = null;
+        if (el.type === 'node') { lat = el.lat; lon = el.lon; }
+        else if (el.center) { lat = el.center.lat; lon = el.center.lon; }
+        if (lat == null || lon == null) continue;
+        courses.push({ id: el.type + '/' + el.id, name, lat, lon, tags });
+      }
+      courses.sort((a,b) => a.name.localeCompare(b.name));
+      return courses;
+    }
+    function populateCourseSelect(courses) {
+      const sel = document.getElementById("courseSelect");
+      sel.innerHTML = "";
+      // Add favourite courses first
+      FAVORITE_COURSES.forEach(fc => {
+        const opt = document.createElement('option');
+        opt.value = fc.id;
+        opt.textContent = `★ ${fc.name}`;
+        sel.appendChild(opt);
+      });
+      // If there are dynamic courses, add a divider option
+      if (courses && courses.length > 0) {
+        const optGroupLabel = document.createElement('option');
+        optGroupLabel.disabled = true;
+        optGroupLabel.textContent = '—— Nearby courses ——';
+        sel.appendChild(optGroupLabel);
+        courses.forEach(c => {
+          const opt = document.createElement('option');
+          opt.value = c.id;
+          opt.textContent = c.name;
+          sel.appendChild(opt);
+        });
+      }
+    }
+    function showCoursesOnMap(courses) {
+      if (courseLayer) map.removeLayer(courseLayer);
+      const markers = (courses || []).map(c => L.circleMarker([c.lat, c.lon], { radius: 6 }));
+      courseLayer = L.layerGroup(markers).addTo(map);
+    }
+    // On load, populate select with favourites only
+    populateCourseSelect([]);
+    // Setup find courses button
+    document.getElementById("btnFindCourses").addEventListener("click", async () => {
+      try {
+        statusText.textContent = "Finding nearby golf courses…";
+        const pos = await getGPS();
+        const { latitude, longitude } = pos.coords;
+        const radius = 30000;
+        const q = `\n[out:json][timeout:25];\n(\n  nwr["leisure"="golf_course"](around:${radius},${latitude},${longitude});\n  nwr["golf"](around:${radius},${latitude},${longitude});\n);\nout center tags;\n`;
+        const osm = await overpassQuery(q);
+        const courses = elementsToCourses(osm);
+        lastFoundCourses = courses;
+        populateCourseSelect(courses);
+        showCoursesOnMap(courses);
+        if (courses.length > 0) {
+          statusText.textContent = `Found ${courses.length} course(s) nearby. Pick one from the list then press Go.`;
+        } else {
+          statusText.textContent = "No courses found nearby from OSM data. Try again, or move closer to the area.";
+        }
+      } catch (e) {
+        statusText.textContent = "Could not search courses. Check internet connection and location permission.";
+        alert("Course search failed: " + (e.message || e));
+      }
+    });
+    // Go to selected course
+    document.getElementById("btnGoCourse").addEventListener("click", () => {
+      const sel = document.getElementById("courseSelect");
+      const id = sel.value;
+      let course = FAVORITE_COURSES.find(c => c.id === id);
+      if (!course) {
+        course = lastFoundCourses.find(c => c.id === id);
+      }
+      if (!course) return;
+      map.setView([course.lat, course.lon], 15);
+      statusText.textContent = `Course selected: ${course.name}. Now set BALL and TARGET.`;
+    });
+    // Marking controls
+    document.getElementById("btnSetBall").addEventListener("click", () => setMode("ball"));
+    document.getElementById("btnSetTarget").addEventListener("click", () => setMode("target"));
+    document.getElementById("btnClear").addEventListener("click", () => {
+      setMode("none");
+      ball = null; target = null; prevBall = null;
+      redrawMarkers();
+    });
+
+    // ---------- Clubs UI ----------
+    const clubInputsDiv = document.getElementById("clubInputs");
+    const clubs = loadClubs();
+    function buildClubInputs() {
+      clubInputsDiv.innerHTML = "";
+      for (const k of CLUB_KEYS) {
+        const wrap = document.createElement("div");
+        wrap.style.display = "grid";
+        wrap.style.gap = "4px";
+        const label = document.createElement("div");
+        label.className = "small";
+        label.textContent = k;
+        const input = document.createElement("input");
+        input.type = "number";
+        input.inputMode = "numeric";
+        input.placeholder = "yards";
+        input.value = clubs[k] === "" ? "" : clubs[k];
+        input.id = "club_" + k;
+        wrap.appendChild(label);
+        wrap.appendChild(input);
+        clubInputsDiv.appendChild(wrap);
+      }
+    }
+    buildClubInputs();
+    document.getElementById("btnSaveClubs").addEventListener("click", () => {
+      const out = {};
+      for (const k of CLUB_KEYS) {
+        const v = document.getElementById("club_" + k).value;
+        out[k] = v === "" ? "" : Number(v);
+      }
+      localStorage.setItem(CLUB_STORAGE_KEY, JSON.stringify(out));
+      alert("Saved club distances on this phone.");
+      updateReadouts();
+    });
+
+    // Initial readout update
+    setMode("none");
+    redrawMarkers();
+  </script>
+</body>
+</html>
